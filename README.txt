@@ -1,4 +1,4 @@
-Supplementary material for manuscript T-IFS-27099-2026
+Supplementary material for manuscript 
 "Unsupervised Deep Anomaly Detection for Bitcoin Wallet Forensics:
 A Hybrid Autoencoder and Isolation Forest Framework"
 
