@@ -4,18 +4,18 @@ from datetime import datetime, timezone
 import gc
 
 # ==================== TUNABLES ====================
-ADDR_LIMIT   = 100000         # ต้องการดึง address กี่อัน
-MAX_PAGES    = 3000         # ไล่บล็อกย้อนหลังได้สูงสุดกี่ "เพจบล็อก" (1 เพจ ~ 10 บล็อก)
-SLEEP_SEC    = 0.25         # หน่วงเวลาใช้ตอนไล่บล็อก/หน้า tx (เก็บ address)
-SLEEP_BETWEEN_WALLETS = 1.0 # หน่วงระหว่างดึงฟีเจอร์แต่ละ address
+ADDR_LIMIT   = 100000         # Number of addresses to fetch
+MAX_PAGES    = 3000           # Max number of block pages to traverse backwards (1 page ~ 10 blocks)
+SLEEP_SEC    = 0.25           # Delay during block/tx pagination (when collecting addresses)
+SLEEP_BETWEEN_WALLETS = 1.0   # Delay between fetching features for each address
 TIMEOUT_SEC  = 15
 RETRY_TIMES  = 3
 
-# แหล่ง Esplora หลาย host ไว้หมุนใช้
+# Multiple Esplora hosts for rotation
 # ESPLORA_SOURCES = ["https://blockstream.info/api", "https://mempool.space/api"]
-ESPLORA_SOURCES = [ "https://mempool.space/api"]
+ESPLORA_SOURCES = ["https://mempool.space/api"]
 
-# ถ้ามี BlockCypher token ใส่เพื่อลด 429
+# Optional BlockCypher token to reduce HTTP 429 rate limits
 BLOCKCYPHER_TOKEN = ""
 # ==================================================
 
@@ -37,7 +37,7 @@ def classify_address_type(addr: str) -> str:
         return "Taproot (P2TR, bech32m)"
     if low.startswith("bc1q"):
         # Native SegWit = bech32
-        # 42 ตัวอักษรโดยมากคือ P2WPKH, ~62 คือ P2WSH
+        # 42 chars is typically P2WPKH, ~62 chars is P2WSH
         if len(a) == 42:
             return "Native SegWit (P2WPKH, bech32)"
         if len(a) in (62, 64):
@@ -64,9 +64,9 @@ def _get_json_with_retry(session: requests.Session, url: str, timeout=TIMEOUT_SE
             time.sleep(min(1.0 * attempt, 5.0))
     return None
 
-# ========== STEP 1: เก็บ Address (แบ่งหน้า + เก็บทั้งส่ง/รับ) ==========
+# ========== STEP 1: Collect Addresses (Paginated + Sender/Receiver) ==========
 def get_recent_wallet_addresses(limit=ADDR_LIMIT, max_pages=MAX_PAGES, sleep_sec=SLEEP_SEC):
-    base = ESPLORA_SOURCES[0]  # ใช้ Blockstream เป็นหลักตอนเก็บ address
+    base = ESPLORA_SOURCES[0]  # Use primary Esplora source when collecting addresses
     s = requests.Session()
     s.headers.update({"User-Agent": "btc-addr-scraper/merged/1.0"})
 
@@ -86,15 +86,15 @@ def get_recent_wallet_addresses(limit=ADDR_LIMIT, max_pages=MAX_PAGES, sleep_sec
             if len(addrs) >= limit: break
             bhash = blk["id"]
 
-            # ไล่หน้า txs ในบล็อก
+            # Paginate through txs in the block
             idx = 0
             while len(addrs) < limit:
                 txs = _get_json_with_retry(s, f"{base}/block/{bhash}/txs/{idx}")
-                if not txs:  # หมดหน้า/ดึงไม่สำเร็จ
+                if not txs:  # End of pages or fetch failed
                     break
 
                 for tx in txs:
-                    # ผู้รับ (vout)
+                    # Receivers (vout)
                     for vout in tx.get("vout", []):
                         a = vout.get("scriptpubkey_address")
                         if a:
@@ -102,7 +102,7 @@ def get_recent_wallet_addresses(limit=ADDR_LIMIT, max_pages=MAX_PAGES, sleep_sec
                             if len(addrs) >= limit: break
                     if len(addrs) >= limit: break
 
-                    # ผู้ส่ง (vin.prevout)
+                    # Senders (vin.prevout)
                     for vin in tx.get("vin", []):
                         prev = vin.get("prevout") or {}
                         a = prev.get("scriptpubkey_address")
@@ -111,7 +111,7 @@ def get_recent_wallet_addresses(limit=ADDR_LIMIT, max_pages=MAX_PAGES, sleep_sec
                             if len(addrs) >= limit: break
                     if len(addrs) >= limit: break
 
-                if len(txs) < 25:   # Esplora คืนทีละ ~25; ถ้าน้อยกว่าแปลว่าหน้าสุดท้าย
+                if len(txs) < 25:   # Esplora returns ~25 per page; fewer means last page
                     break
                 idx += len(txs)
                 time.sleep(sleep_sec)
@@ -124,7 +124,7 @@ def get_recent_wallet_addresses(limit=ADDR_LIMIT, max_pages=MAX_PAGES, sleep_sec
 
     return list(addrs)
 
-# ========== STEP 2A: ฟีเจอร์จาก Esplora (Blockstream/mempool) ==========
+# ========== STEP 2A: Features from Esplora (Blockstream/mempool) ==========
 def fetch_wallet_features_from_esplora(address: str, max_tx_pages=2, sleep_sec=0.3):
     s = requests.Session()
     s.headers.update({"User-Agent": "btc-addr-scraper/merged/1.0"})
@@ -149,7 +149,7 @@ def fetch_wallet_features_from_esplora(address: str, max_tx_pages=2, sleep_sec=0
         unconf  = (funded_mem - spent_mem) / 1e8
         final_balance = balance + unconf
 
-        # เวลาที่ใช้งาน (จำกัดหน้าเพื่อลดโหลด/เลี่ยง 429)
+        # Active timestamps (limit pages to reduce load / avoid 429)
         times = []
         page = get_json(base, f"/address/{address}/txs")
         pages = 0
@@ -194,7 +194,7 @@ def fetch_wallet_features_from_esplora(address: str, max_tx_pages=2, sleep_sec=0
         }
     return None
 
-# ========== STEP 2B: ฟีเจอร์จาก Blockchain.info ==========
+# ========== STEP 2B: Features from Blockchain.info ==========
 def fetch_wallet_features_from_blockchain_info(address: str):
     url = f"https://blockchain.info/rawaddr/{address}?limit=50"
     try:
@@ -241,7 +241,7 @@ def fetch_wallet_features_from_blockchain_info(address: str):
         "min_tx_value": 0.0, "total_tx_value": 0.0
     }
 
-# ========== STEP 2C: BlockCypher + fallback ==========
+# ========== STEP 2C: BlockCypher + Fallbacks ==========
 def fetch_wallet_features_full(address: str):
     url = f"https://api.blockcypher.com/v1/btc/main/addrs/{address}?limit=50"
     if BLOCKCYPHER_TOKEN:
@@ -250,7 +250,7 @@ def fetch_wallet_features_full(address: str):
     try:
         resp = requests.get(url, timeout=TIMEOUT_SEC)
     except requests.RequestException:
-        # ถ้าเรียกไม่ได้ ให้ fallback
+        # Fallback if request fails
         return (fetch_wallet_features_from_esplora(address)
                 or fetch_wallet_features_from_blockchain_info(address))
 
@@ -299,21 +299,20 @@ def fetch_wallet_features_full(address: str):
             "total_tx_value": total_tx_value
         }
     else:
-        # HTTP 429/403/5xx → fallback
+        # HTTP 429/403/5xx -> fallback
         return (fetch_wallet_features_from_esplora(address)
                 or fetch_wallet_features_from_blockchain_info(address))
-    
 
 
-
-# ========== STEP 3: รวมทั้งหมด ==========
+# ========== STEP 3: Main Execution ==========
 def main():
-    print("📦 Loading recent wallet addresses (with pagination, in/out capture)...")
+    print("Loading recent wallet addresses (with pagination, in/out capture)...")
     wallets = get_recent_wallet_addresses(limit=ADDR_LIMIT, max_pages=MAX_PAGES, sleep_sec=SLEEP_SEC)
-    print(f"✅ Found {len(wallets)} addresses")
+    print(f"Found {len(wallets)} addresses")
     if not wallets:
-        print("⚠️ No addresses collected. Try increasing MAX_PAGES or adjusting SLEEP_SEC."); return
-    #print("🔎 Sample:", wallets[:10], "\n")
+        print("No addresses collected. Try increasing MAX_PAGES or adjusting SLEEP_SEC.")
+        return
+    # print("Sample:", wallets[:10], "\n")
 
     features, failed = [], []
     for i, addr in enumerate(wallets, start=1):
@@ -326,13 +325,13 @@ def main():
         time.sleep(SLEEP_BETWEEN_WALLETS)
 
     df = pd.DataFrame(features)
-    print(f"\n✅ Retrieved data: {len(df)} rows (from {len(wallets)} addresses)")
+    print(f"\nRetrieved data: {len(df)} rows (from {len(wallets)} addresses)")
     if failed:
-        print("⚠️ Failed addresses:", failed)
+        print("Failed addresses:", failed)
     ts = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
     out = f"wallet_dataset_detailed_{ts}.csv"
     df.to_csv(out, index=False)
-    print(f"\n💾 Saved file as '{out}'")
+    print(f"\nSaved file as '{out}'")
     gc.collect()
 
 if __name__ == "__main__":
